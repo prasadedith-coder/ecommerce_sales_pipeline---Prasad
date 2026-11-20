@@ -3682,9 +3682,306 @@ ZD-21925	Zuschuss Donatelli	2016	206.67
 ZD-21925	Zuschuss Donatelli	2017	16.59
 
 2,499 rows
-
-
-
-
-
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+
+
+Pipeline tests
+Unit tests for everything ecommerce_sales_pipeline builds. Run the pipeline notebook first - the tests read the tables it writes, and the little check below fails fast if that step was skipped.
+
+# the tests read the tables the pipeline notebook wrote, so make sure it
+# actually ran before anything blows up with a confusing
+# 'table or view not found' halfway through the suite
+SCHEMA = "workspace.ecommerce_sales"
+
+for t in [
+    "raw_customers",
+    "raw_products",
+    "raw_orders",
+    "enriched_customers",
+    "enriched_products",
+    "enriched_orders",
+    "agg_profit_by_year_category_subcategory_customer",
+]:
+    spark.table(f"{SCHEMA}.{t}")
+print("pipeline tables all present - good to go")
+
+pipeline tables all present - good to go
+
+import datetime
+import unittest
+
+from pyspark.sql import functions as F
+
+class NameCleaningTests(unittest.TestCase):
+"""the name cleanup as it actually landed in enriched_customers. the
+    golden values come straight from the source file - 'Gary567 Hansen',
+    'Bi1l Stewart', '   _Mike Vitt 12313orini' and so on"""
+
+    def _name(self, customer_id):
+        rows = (
+            spark.table(f"{SCHEMA}.enriched_customers")
+            .where(F.col("customer_id") == customer_id)
+            .select("customer_name")
+            .collect()
+        )
+        return rows[0]["customer_name"]
+
+    def test_damaged_names_get_repaired(self):
+        # digits and junk jammed into the name get stripped out
+        self.assertEqual(self._name("GH-14410"), "Gary Hansen")
+        self.assertEqual(self._name("BS-11380"), "Bil Stewart")
+        self.assertEqual(self._name("MV-18190"), "Mike Vitt orini")
+
+    def test_clean_names_left_alone(self):
+        self.assertEqual(self._name("PW-19240"), "Pierre Wener")
+
+    def test_source_nulls_stay_null(self):
+        # a few customers have no name in the source sheet at all
+        self.assertIsNone(self._name("SH-19975"))
+
+    def test_no_junk_left_anywhere(self):
+        # after cleanup no name should still carry digits or punctuation
+        dirty = (
+            spark.table(f"{SCHEMA}.enriched_customers")
+            .where(
+                F.col("customer_name").isNotNull()
+                & F.col("customer_name").rlike("[^A-Za-z'\\- ]")
+            )
+        )
+        self.assertEqual(dirty.count(), 0)
+
+
+class DateParsingTests(unittest.TestCase):
+    """day-first dates are the kind of thing that breaks silently, so they get
+    their own tests"""
+
+    def test_day_first_parse(self):
+        df = spark.createDataFrame(
+            [("21/8/2016",), ("3/10/2014",), ("27/11/2016",)], "d string"
+        )
+        got = [
+            r["dt"]
+            for r in df.select(F.expr("try_to_date(d, 'd/M/yyyy')").alias("dt")).collect()
+        ]
+        self.assertEqual(
+            got,
+            [
+                datetime.date(2016, 8, 21),
+                datetime.date(2014, 10, 3),
+                datetime.date(2016, 11, 27),
+            ],
+        )
+
+    def test_no_unparsed_dates_in_fact_table(self):
+        fact = spark.table(f"{SCHEMA}.enriched_orders")
+        self.assertEqual(
+            fact.where("order_date IS NULL OR ship_date IS NULL").count(), 0
+        )
+
+    def test_year_tracks_the_parsed_date(self):
+        fact = spark.table(f"{SCHEMA}.enriched_orders")
+        bad = fact.where(F.year("order_date") != F.col("order_year"))
+        self.assertEqual(bad.count(), 0)
+
+class RawLoadTests(unittest.TestCase):
+
+"""golden row counts straight off the source files"""
+
+    def test_raw_counts(self):
+        self.assertEqual(spark.table(f"{SCHEMA}.raw_customers").count(), 793)
+        self.assertEqual(spark.table(f"{SCHEMA}.raw_products").count(), 1851)
+        self.assertEqual(spark.table(f"{SCHEMA}.raw_orders").count(), 9994)
+
+    def test_customer_ids_stay_unique(self):
+        dupes = (
+            spark.table(f"{SCHEMA}.enriched_customers")
+            .groupBy("customer_id")
+            .count()
+            .where("count > 1")
+        )
+        self.assertEqual(dupes.count(), 0)
+
+
+class EnrichedOrdersTests(unittest.TestCase):
+    """the fact table itself"""
+
+    def setUp(self):
+        self.fact = spark.table(f"{SCHEMA}.enriched_orders")
+
+    def test_no_rows_lost_or_fanned_out(self):
+        # every order line has to survive the joins exactly once
+        self.assertEqual(
+            self.fact.count(), spark.table(f"{SCHEMA}.raw_orders").count()
+        )
+        self.assertEqual(self.fact.count(), 9994)
+
+    def test_profit_rounded_to_two_decimals(self):
+        bad = self.fact.where(
+            F.abs(F.col("profit") - F.round(F.col("profit"), 2)) > 1e-9
+        )
+        self.assertEqual(bad.count(), 0)
+
+    def test_profit_total_survives_rounding(self):
+        raw_total = (
+            spark.table(f"{SCHEMA}.raw_orders")
+            .agg(F.sum("profit").alias("t"))
+            .collect()[0]["t"]
+        )
+        fact_total = self.fact.agg(F.sum("profit").alias("t")).collect()[0]["t"]
+        # rounding at 2dp is the only touch on profit, so totals must agree
+        self.assertAlmostEqual(raw_total, fact_total, places=2)
+
+    def test_customer_fields_always_populated(self):
+        # a few customers have no name in the source - those rows land as
+        # 'Unknown', never null, so the joins can't silently drop anyone
+        self.assertEqual(
+            self.fact.where("customer_name IS NULL OR country IS NULL").count(),
+            0,
+        )
+
+    def test_product_fields_always_populated(self):
+        # unknown products land as 'Unknown', never null
+        self.assertEqual(
+            self.fact.where("category IS NULL OR sub_category IS NULL").count(),
+            0,
+        )
+
+    def test_sane_numeric_ranges(self):
+        self.assertEqual(self.fact.where("discount < 0 OR discount > 1").count(), 0)
+        self.assertEqual(self.fact.where("quantity <= 0").count(), 0)
+        self.assertEqual(self.fact.where("ship_date < order_date").count(), 0)
+
+
+class EnrichedProductsTests(unittest.TestCase):
+    """the product master, including the csv mis-parse repair"""
+
+    def setUp(self):
+        self.dim = spark.table(f"{SCHEMA}.enriched_products")
+
+    def test_price_null_only_where_flagged(self):
+        # damaged rows lost their price in the parse; every other row has to
+        # have parsed cleanly
+        bad = self.dim.where(
+            (F.col("price").isNull() & ~F.col("damaged_row"))
+            | (F.col("price").isNotNull() & F.col("damaged_row"))
+        )
+        self.assertEqual(bad.count(), 0)
+
+    def test_repaired_rows_keep_their_category(self):
+        # the fact table's product lookup depends on category/sub-category
+        # surviving the repair
+        broken = self.dim.where(
+            F.col("damaged_row")
+            & (F.col("category").isNull() | F.col("sub_category").isNull())
+        )
+        self.assertEqual(broken.count(), 0)
+
+    def test_repaired_states_no_longer_carry_name_fragments(self):
+        # before the repair the state column held things like ' Black"' -
+        # after it every state should look like an actual state name
+        suspects = self.dim.where(
+            F.col("damaged_row") & ~F.col("state").rlike("^[A-Za-z ]+$")
+        )
+        self.assertEqual(suspects.count(), 0)
+
+
+class AggregateTests(unittest.TestCase):
+    """the aggregate table and the SQL cuts on top of it"""
+
+    KEYS = ["order_year", "category", "sub_category", "customer_id", "customer_name"]
+
+    def setUp(self):
+        self.agg = spark.table(
+            f"{SCHEMA}.agg_profit_by_year_category_subcategory_customer"
+        )
+        self.fact = spark.table(f"{SCHEMA}.enriched_orders")
+
+    def test_grain_is_unique(self):
+        dupes = self.agg.groupBy(*self.KEYS).count().where("count > 1")
+        self.assertEqual(dupes.count(), 0)
+
+    def test_reconciles_with_the_fact_table(self):
+        # rebuild the aggregate from the fact table independently and compare
+        # both ways - if they disagree, the aggregate is the wrong one
+        rebuilt = self.fact.groupBy(*self.KEYS).agg(
+            F.round(F.sum("profit"), 2).alias("total_profit")
+        )
+        a = self.agg.select(*self.KEYS, "total_profit")
+        b = rebuilt.select(*self.KEYS, "total_profit")
+        self.assertEqual(a.exceptAll(b).count() + b.exceptAll(a).count(), 0)
+
+    def test_profit_by_year_sql_matches_pyspark(self):
+        # the SQL the stakeholders run has to agree with a plain groupby
+        sql_side = {
+            r["order_year"]: float(r["profit"])
+            for r in spark.sql("""
+                SELECT order_year, ROUND(SUM(total_profit), 2) AS profit
+                FROM workspace.ecommerce_sales.agg_profit_by_year_category_subcategory_customer
+                GROUP BY order_year
+            """).collect()
+        }
+        df_side = {
+            r["order_year"]: float(r["profit"])
+            for r in self.agg.groupBy("order_year")
+            .agg(F.round(F.sum("total_profit"), 2).alias("profit"))
+            .collect()
+        }
+        self.assertEqual(sql_side, df_side)
+
+# run the lot and fail loudly - the point is a single green/red signal
+loader = unittest.defaultTestLoader
+suite = unittest.TestSuite()
+for cls in [
+    RawLoadTests,
+    NameCleaningTests,
+    DateParsingTests,
+    EnrichedProductsTests,
+    EnrichedOrdersTests,
+    AggregateTests,
+]:
+    suite.addTests(loader.loadTestsFromTestCase(cls))
+
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+
+assert result.wasSuccessful(), (
+    f"{len(result.failures)} failures, {len(result.errors)} errors"
+)
+print(f"\n{result.testsRun} tests, all green")
+
+test_customer_ids_stay_unique (__main__.RawLoadTests.test_customer_ids_stay_unique) ... ok
+test_raw_counts (__main__.RawLoadTests.test_raw_counts) ... ok
+test_clean_names_left_alone (__main__.NameCleaningTests.test_clean_names_left_alone) ... ok
+test_damaged_names_get_repaired (__main__.NameCleaningTests.test_damaged_names_get_repaired) ... ok
+test_no_junk_left_anywhere (__main__.NameCleaningTests.test_no_junk_left_anywhere) ... ok
+test_source_nulls_stay_null (__main__.NameCleaningTests.test_source_nulls_stay_null) ... ok
+test_day_first_parse (__main__.DateParsingTests.test_day_first_parse) ... ok
+test_no_unparsed_dates_in_fact_table (__main__.DateParsingTests.test_no_unparsed_dates_in_fact_table) ... ok
+test_year_tracks_the_parsed_date (__main__.DateParsingTests.test_year_tracks_the_parsed_date) ... ok
+test_price_null_only_where_flagged (__main__.EnrichedProductsTests.test_price_null_only_where_flagged) ... ok
+test_repaired_rows_keep_their_category (__main__.EnrichedProductsTests.test_repaired_rows_keep_their_category) ... ok
+test_repaired_states_no_longer_carry_name_fragments (__main__.EnrichedProductsTests.test_repaired_states_no_longer_carry_name_fragments) ... FAIL
+test_customer_fields_always_populated (__main__.EnrichedOrdersTests.test_customer_fields_always_populated) ... ok
+test_no_rows_lost_or_fanned_out (__main__.EnrichedOrdersTests.test_no_rows_lost_or_fanned_out) ... ok
+test_product_fields_always_populated (__main__.EnrichedOrdersTests.test_product_fields_always_populated) ... ok
+test_profit_rounded_to_two_decimals (__main__.EnrichedOrdersTests.test_profit_rounded_to_two_decimals) ... ok
+test_profit_total_survives_rounding (__main__.EnrichedOrdersTests.test_profit_total_survives_rounding) ... ok
+test_sane_numeric_ranges (__main__.EnrichedOrdersTests.test_sane_numeric_ranges) ... ok
+test_grain_is_unique (__main__.AggregateTests.test_grain_is_unique) ... ok
+test_profit_by_year_sql_matches_pyspark (__main__.AggregateTests.test_profit_by_year_sql_matches_pyspark) ... ok
+test_reconciles_with_the_fact_table (__main__.AggregateTests.test_reconciles_with_the_fact_table) ... ok
+
+======================================================================
+FAIL: test_repaired_states_no_longer_carry_name_fragments (__main__.EnrichedProductsTests.test_repaired_states_no_longer_carry_name_fragments)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/spark-e997cdf4-bc89-4291-a618-53/.ipykernel/74/command-6057392534379620-2217097548", line 99, in test_repaired_states_no_longer_carry_name_fragments
+    self.assertEqual(suspects.count(), 0)
+AssertionError: 4 != 0
+
+----------------------------------------------------------------------
+Ran 21 tests in 14.695s
+
+FAILED (failures=1)
+
+
+
